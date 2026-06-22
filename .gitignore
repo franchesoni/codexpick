@@ -1,0 +1,15 @@
+.env
+auth*.json
+*.bak-*
+*.log
+*.sqlite
+*.sqlite-*
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+.DS_Store

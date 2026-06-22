@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codexpick"
+version = "0.1.0"
+description = "Pick the first local Codex auth snapshot whose live quota is usable."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "franchesoni" }
+]
+keywords = ["codex", "cli", "auth"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development",
+  "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/franchesoni/codexpick"
+Repository = "https://github.com/franchesoni/codexpick"
+Issues = "https://github.com/franchesoni/codexpick/issues"
+
+[project.scripts]
+codexpick = "codexpick_cli:run"
+
+[tool.setuptools]
+py-modules = ["codexpick_cli"]
