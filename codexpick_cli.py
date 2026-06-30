@@ -8,6 +8,7 @@ import pty
 import re
 import select
 import secrets
+import signal
 import shutil
 import socket
 import stat
@@ -397,7 +398,7 @@ def probe_app_server(candidate: Candidate, codex_home: Path, codex_bin: Path, ti
 
     tmp_root = codex_home / ".tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="codexpick-", dir=tmp_root) as tmp:
+    with tempfile.TemporaryDirectory(prefix="codexpick-", dir=tmp_root, ignore_cleanup_errors=True) as tmp:
         tmp_home = Path(tmp)
         config = codex_home / "config.toml"
         if config.exists():
@@ -415,6 +416,7 @@ def probe_app_server(candidate: Candidate, codex_home: Path, codex_bin: Path, ti
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=True,
         )
         try:
             wait_for_socket(proc, sock_path, timeout)
@@ -478,7 +480,7 @@ def is_method_unavailable(exc: Exception) -> bool:
 def fallback_status_probe(candidate: Candidate, codex_home: Path, codex_bin: Path, timeout: float) -> dict:
     tmp_root = codex_home / ".tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="codexpick-status-", dir=tmp_root) as tmp:
+    with tempfile.TemporaryDirectory(prefix="codexpick-status-", dir=tmp_root, ignore_cleanup_errors=True) as tmp:
         tmp_home = Path(tmp)
         config = codex_home / "config.toml"
         if config.exists():
@@ -497,6 +499,7 @@ def fallback_status_probe(candidate: Candidate, codex_home: Path, codex_bin: Pat
             stdout=slave_fd,
             stderr=slave_fd,
             close_fds=True,
+            start_new_session=True,
         )
         os.close(slave_fd)
         output = bytearray()
@@ -555,12 +558,24 @@ def strip_ansi(text: str) -> str:
 
 def stop_process(proc: subprocess.Popen) -> None:
     if proc.poll() is None:
-        proc.terminate()
+        terminate_process_group(proc, signal.SIGTERM)
     try:
         proc.communicate(timeout=3)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        terminate_process_group(proc, signal.SIGKILL)
         proc.communicate()
+
+
+def terminate_process_group(proc: subprocess.Popen, sig: signal.Signals) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        if sig == signal.SIGTERM:
+            proc.terminate()
+        else:
+            proc.kill()
 
 
 def read_stderr(proc: subprocess.Popen) -> str:
