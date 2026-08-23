@@ -58,17 +58,17 @@ class ProbeResult:
                 return str(reached)
         snapshot = display_snapshot(self.rate_limits)
         short_window = used_percent(snapshot.get("primary"))
-        if short_window is None:
-            return "5h usage missing"
-        if short_window >= 100:
+        if short_window is not None and short_window >= 100:
             return "5h quota spent"
         weekly = used_percent(snapshot.get("secondary"))
-        if weekly is None:
-            return "weekly usage missing"
-        if weekly >= 100:
+        if weekly is not None and weekly >= 100:
             return "weekly quota spent"
-        if self.account.get("requiresOpenaiAuth") and not self.account.get("account"):
-            return ""
+        if (
+            self.account.get("requiresOpenaiAuth")
+            and not self.account.get("account")
+            and not snapshots(self.rate_limits)
+        ):
+            return "authentication required"
         return ""
 
     @property
@@ -185,20 +185,29 @@ def main() -> int:
         print(f"No candidates found in {codex_home}/auth-*.json", file=sys.stderr)
         return 2
 
+    forced_candidate = find_candidate(candidates, args.account) if args.account else None
+    if args.account and not forced_candidate:
+        print(f"No account named {args.account!r} found in {codex_home}/auth-*.json", file=sys.stderr)
+        print("Available accounts: " + ", ".join(c.name for c in candidates), file=sys.stderr)
+        return 2
+
     refresh_candidates_from_active_auth(auth_path, candidates)
+
+    # An explicit account choice is authoritative. Switching it should not
+    # contact every saved account (or even the selected account) first.
+    if forced_candidate and not args.check_only:
+        print(f"Selected: {forced_candidate.name}")
+        return activate_candidate(args, auth_path, codex_bin, forced_candidate)
+
     results = []
-    for candidate in candidates:
+    candidates_to_probe = [forced_candidate] if forced_candidate else candidates
+    for candidate in candidates_to_probe:
         print(f"Probing {candidate.name}...", file=sys.stderr, flush=True)
         result = probe_candidate(candidate, codex_home, codex_bin, args.timeout)
         results.append(result)
         status = result.blocked_reason or "ok"
         print(f"Probed {candidate.name}: {status}", file=sys.stderr, flush=True)
     mark_duplicate_accounts(results)
-    forced_candidate = find_candidate(candidates, args.account) if args.account else None
-    if args.account and not forced_candidate:
-        print(f"No account named {args.account!r} found in {codex_home}/auth-*.json", file=sys.stderr)
-        print("Available accounts: " + ", ".join(c.name for c in candidates), file=sys.stderr)
-        return 2
     selected = (
         next((r for r in results if r.candidate == forced_candidate), None)
         if forced_candidate
@@ -216,7 +225,16 @@ def main() -> int:
     if args.check_only:
         return 0
 
-    changed = switch_auth(auth_path, selected.candidate.path)
+    return activate_candidate(args, auth_path, codex_bin, selected.candidate)
+
+
+def activate_candidate(
+    args: argparse.Namespace,
+    auth_path: Path,
+    codex_bin: Path,
+    candidate: Candidate,
+) -> int:
+    changed = switch_auth(auth_path, candidate.path)
     print("auth.json updated." if changed else "auth.json already matched selected account.")
 
     if args.no_launch:
