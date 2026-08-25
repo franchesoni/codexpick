@@ -8,6 +8,7 @@ import pty
 import re
 import select
 import secrets
+import shlex
 import signal
 import shutil
 import socket
@@ -27,6 +28,10 @@ VERSION = "0.1.0"
 
 
 class ProbeError(Exception):
+    pass
+
+
+class ActivationError(Exception):
     pass
 
 
@@ -74,6 +79,13 @@ class ProbeResult:
     @property
     def usable(self) -> bool:
         return not self.blocked_reason
+
+
+@dataclass
+class DaemonState:
+    socket_path: Path
+    account_email: str | None
+    unsafe_thread_statuses: list[str]
 
 
 class RawWebSocket:
@@ -205,7 +217,7 @@ def main() -> int:
         print(f"Probing {candidate.name}...", file=sys.stderr, flush=True)
         result = probe_candidate(candidate, codex_home, codex_bin, args.timeout)
         results.append(result)
-        status = result.blocked_reason or "ok"
+        status = display_result_status(result)
         print(f"Probed {candidate.name}: {status}", file=sys.stderr, flush=True)
     mark_duplicate_accounts(results)
     selected = (
@@ -214,6 +226,7 @@ def main() -> int:
         else next((r for r in results if r.usable), None)
     )
     print_table(results, selected)
+    print_reauth_hints(results)
 
     if not selected:
         print("No usable account found; auth.json was left unchanged.", file=sys.stderr)
@@ -234,8 +247,16 @@ def activate_candidate(
     codex_bin: Path,
     candidate: Candidate,
 ) -> int:
-    changed = switch_auth(auth_path, candidate.path)
+    try:
+        changed, restarted = activate_auth_snapshot(
+            auth_path, candidate.path, codex_bin, args.timeout
+        )
+    except ActivationError as exc:
+        print(f"Account switch refused: {exc}", file=sys.stderr)
+        return 3
     print("auth.json updated." if changed else "auth.json already matched selected account.")
+    if restarted:
+        print("Idle Codex app-server restarted with the selected account.")
 
     if args.no_launch:
         return 0
@@ -311,8 +332,16 @@ def login_subscription(args: argparse.Namespace, codex_home: Path, auth_path: Pa
         if args.no_activate:
             return 0
 
-        changed_active = switch_auth(auth_path, target_path)
+        try:
+            changed_active, restarted = activate_auth_snapshot(
+                auth_path, target_path, codex_bin, args.timeout
+            )
+        except ActivationError as exc:
+            print(f"Saved {target_path.name}, but activation was refused: {exc}", file=sys.stderr)
+            return 3
         print("auth.json updated." if changed_active else "auth.json already matched new subscription.")
+        if restarted:
+            print("Idle Codex app-server restarted with the new subscription.")
 
         if args.no_launch:
             return 0
@@ -643,7 +672,7 @@ def print_table(results: list[ProbeResult], selected: ProbeResult | None) -> Non
             fmt_percent(snap.get("secondary")),
             fmt_reset(snap.get("primary")),
             fmt_reset(snap.get("secondary")),
-            result.blocked_reason or "ok",
+            display_result_status(result),
         ])
 
     headers = ["", "account", "plan", "5h used", "weekly used", "5h reset", "weekly reset", "status"]
@@ -652,6 +681,38 @@ def print_table(results: list[ProbeResult], selected: ProbeResult | None) -> Non
     print("  ".join("-" * widths[i] for i in range(len(headers))))
     for row in rows:
         print("  ".join(str(row[i]).ljust(widths[i]) for i in range(len(row))))
+
+
+def display_result_status(result: ProbeResult, max_length: int = 52) -> str:
+    reason = result.blocked_reason or "ok"
+    if result.error and is_reauth_error(result.error):
+        return "reauth required"
+    if len(reason) <= max_length:
+        return reason
+    return reason[: max_length - 3].rstrip() + "..."
+
+
+def is_reauth_error(error: str | None) -> bool:
+    if not error:
+        return False
+    lowered = error.lower()
+    auth_markers = (
+        "token_invalidated",
+        "unauthorized_unknown",
+        "authentication token has been invalidated",
+        "could not parse your authentication token",
+        "try signing in again",
+    )
+    return any(marker in lowered for marker in auth_markers)
+
+
+def print_reauth_hints(results: list[ProbeResult]) -> None:
+    affected = [result.candidate.name for result in results if is_reauth_error(result.error)]
+    if not affected:
+        return
+    print("\nRenew saved login(s) without changing the active Codex account:")
+    for name in affected:
+        print(f"  codexpick --login {shlex.quote(name)} --no-activate")
 
 
 def fmt_percent(window) -> str:
@@ -702,6 +763,212 @@ def switch_auth(auth_path: Path, selected_path: Path) -> bool:
             tmp_path.unlink()
 
 
+def activate_auth_snapshot(
+    auth_path: Path,
+    selected_path: Path,
+    codex_bin: Path,
+    timeout: float,
+) -> tuple[bool, bool]:
+    """Install an auth snapshot and safely synchronize a managed app-server.
+
+    A long-lived app-server caches managed ChatGPT credentials. Replacing
+    auth.json without restarting that server leaves Codex on the old account.
+    Never restart while a turn is active, and never change auth.json if the
+    daemon cannot be inspected safely.
+    """
+    daemon = inspect_managed_daemon(auth_path.parent, codex_bin, timeout)
+    selected_email = read_auth_email(selected_path)
+    daemon_matches = bool(
+        daemon
+        and daemon.account_email
+        and selected_email
+        and daemon.account_email.casefold() == selected_email.casefold()
+    )
+    restart_required = bool(daemon and not daemon_matches)
+
+    if restart_required and daemon.unsafe_thread_statuses:
+        active = sum(status == "active" for status in daemon.unsafe_thread_statuses)
+        detail = (
+            f"{active} active turn(s)"
+            if active
+            else "loaded threads with an unknown or unsafe status"
+        )
+        raise ActivationError(
+            f"the shared Codex app-server is using another account and has {detail}; "
+            "auth.json was left unchanged. Finish those turns and run codexpick again"
+        )
+
+    previous_path = None
+    previous_existed = auth_path.exists()
+    if restart_required and previous_existed:
+        fd, previous_name = tempfile.mkstemp(
+            prefix=".auth.codexpick-rollback.", suffix=".json", dir=auth_path.parent
+        )
+        os.close(fd)
+        previous_path = Path(previous_name)
+        shutil.copy2(auth_path, previous_path)
+
+    changed = False
+    try:
+        changed = switch_auth(auth_path, selected_path)
+        if not restart_required:
+            return changed, False
+
+        restart_managed_daemon(auth_path.parent, codex_bin, selected_email, timeout)
+        return changed, True
+    except Exception as exc:
+        recovery_error = None
+        if restart_required:
+            try:
+                if previous_path:
+                    switch_auth(auth_path, previous_path)
+                elif not previous_existed:
+                    auth_path.unlink(missing_ok=True)
+                run_daemon_restart(auth_path.parent, codex_bin, timeout)
+            except Exception as recovery_exc:
+                recovery_error = compact_error(recovery_exc)
+        message = compact_error(exc)
+        if recovery_error:
+            message += f"; restoring the previous daemon state also failed: {recovery_error}"
+        action = "reload" if restart_required else "install"
+        raise ActivationError(f"could not {action} the selected account ({message})") from exc
+    finally:
+        if previous_path:
+            previous_path.unlink(missing_ok=True)
+
+
+def inspect_managed_daemon(
+    codex_home: Path,
+    codex_bin: Path,
+    timeout: float,
+) -> DaemonState | None:
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+    try:
+        completed = subprocess.run(
+            [str(codex_bin), "app-server", "daemon", "version"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(3.0, min(timeout, 10.0)),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ActivationError(f"could not inspect the Codex app-server: {compact_error(exc)}") from exc
+
+    fallback_socket = codex_home / "app-server-control" / "app-server-control.sock"
+    if completed.returncode != 0:
+        if fallback_socket.exists():
+            detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else completed.returncode
+            raise ActivationError(f"could not inspect the running Codex app-server: {detail}")
+        # Older Codex installations do not have a managed daemon. In that
+        # case the next ordinary Codex process reads auth.json at startup.
+        return None
+
+    info = parse_last_json_object(completed.stdout)
+    if not info:
+        if fallback_socket.exists():
+            raise ActivationError("the Codex daemon returned an unreadable status")
+        return None
+    if info.get("status") != "running":
+        return None
+
+    socket_value = info.get("socketPath")
+    sock_path = Path(socket_value) if isinstance(socket_value, str) and socket_value else fallback_socket
+    if not sock_path.exists():
+        raise ActivationError(f"the Codex daemon reports a missing control socket: {sock_path}")
+
+    try:
+        ws = RawWebSocket(sock_path, timeout)
+        try:
+            rpc(ws, 101, "initialize", {
+                "clientInfo": {"name": "codexpick", "version": VERSION},
+                "capabilities": {"experimentalApi": True},
+            }, timeout)
+            ws.send_json({"method": "initialized"})
+            account_result = rpc(ws, 102, "account/read", {"refreshToken": False}, timeout) or {}
+            account = account_result.get("account") or {}
+            account_email = account.get("email") if isinstance(account, dict) else None
+            if not isinstance(account_email, str) or not account_email:
+                account_email = None
+
+            loaded = rpc(ws, 103, "thread/loaded/list", {}, timeout) or {}
+            thread_ids = loaded.get("data") if isinstance(loaded, dict) else None
+            if not isinstance(thread_ids, list):
+                raise ProbeError("thread/loaded/list returned an invalid response")
+
+            unsafe_statuses = []
+            for offset, thread_id in enumerate(thread_ids, 104):
+                result = rpc(
+                    ws,
+                    offset,
+                    "thread/read",
+                    {"threadId": thread_id, "includeTurns": False},
+                    timeout,
+                ) or {}
+                thread = result.get("thread") if isinstance(result, dict) else None
+                status = thread.get("status") if isinstance(thread, dict) else None
+                status_type = status.get("type") if isinstance(status, dict) else None
+                if status_type not in {"idle", "notLoaded", "systemError"}:
+                    unsafe_statuses.append(status_type or "unknown")
+            return DaemonState(sock_path, account_email, unsafe_statuses)
+        finally:
+            ws.close()
+    except ActivationError:
+        raise
+    except Exception as exc:
+        raise ActivationError(f"could not safely inspect loaded Codex turns: {compact_error(exc)}") from exc
+
+
+def restart_managed_daemon(
+    codex_home: Path,
+    codex_bin: Path,
+    selected_email: str | None,
+    timeout: float,
+) -> None:
+    run_daemon_restart(codex_home, codex_bin, timeout)
+    restarted = inspect_managed_daemon(codex_home, codex_bin, timeout)
+    if not restarted:
+        raise ActivationError("Codex app-server did not come back after restart")
+    if selected_email:
+        if not restarted.account_email:
+            raise ActivationError("restarted Codex app-server did not load the selected account")
+        if restarted.account_email.casefold() != selected_email.casefold():
+            raise ActivationError("restarted Codex app-server loaded a different account")
+
+
+def run_daemon_restart(codex_home: Path, codex_bin: Path, timeout: float) -> None:
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(codex_home)
+    try:
+        completed = subprocess.run(
+            [str(codex_bin), "app-server", "daemon", "restart"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(10.0, timeout),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ActivationError(f"Codex daemon restart failed: {compact_error(exc)}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or str(completed.returncode)
+        raise ActivationError(f"Codex daemon restart failed: {compact_error(Exception(detail))}")
+
+
+def parse_last_json_object(text: str) -> dict | None:
+    for line in reversed(text.splitlines()):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
 def refresh_candidates_from_active_auth(auth_path: Path, candidates: list[Candidate]) -> None:
     active_account_key = read_account_key(auth_path)
     if not active_account_key:
@@ -746,6 +1013,23 @@ def read_account_id(path: Path) -> str | None:
     return account_id if isinstance(account_id, str) and account_id else None
 
 
+def read_auth_email(path: Path) -> str | None:
+    data = read_auth_json(path)
+    tokens = data.get("tokens", {}) if isinstance(data, dict) else {}
+    if not isinstance(tokens, dict):
+        return None
+    for name in ("id_token", "access_token"):
+        claims = read_token_claims(tokens.get(name))
+        email = claims.get("email") if isinstance(claims, dict) else None
+        if isinstance(email, str) and email:
+            return email
+        profile = claims.get("https://api.openai.com/profile", {}) if isinstance(claims, dict) else {}
+        email = profile.get("email") if isinstance(profile, dict) else None
+        if isinstance(email, str) and email:
+            return email
+    return None
+
+
 def read_auth_json(path: Path) -> dict | None:
     try:
         with path.open("r", encoding="utf-8") as fh:
@@ -755,15 +1039,8 @@ def read_auth_json(path: Path) -> dict | None:
 
 
 def read_token_user_id(token) -> str | None:
-    if not isinstance(token, str):
-        return None
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return None
-        payload = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
-        claims = json.loads(base64.urlsafe_b64decode(payload))
-    except (ValueError, json.JSONDecodeError):
+    claims = read_token_claims(token)
+    if not claims:
         return None
     auth_claims = claims.get("https://api.openai.com/auth", {})
     if isinstance(auth_claims, dict):
@@ -773,6 +1050,20 @@ def read_token_user_id(token) -> str | None:
                 return value
     value = claims.get("sub")
     return value if isinstance(value, str) and value else None
+
+
+def read_token_claims(token) -> dict:
+    if not isinstance(token, str):
+        return {}
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return {}
+        payload = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (ValueError, json.JSONDecodeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
 
 
 def sha256_file(path: Path) -> str:

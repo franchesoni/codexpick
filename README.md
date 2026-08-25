@@ -80,14 +80,26 @@ Switch without launching:
 codexpick --no-launch
 ```
 
+If a managed Codex app-server is running, `codexpick` checks its in-memory
+account before changing `auth.json`. An idle daemon is restarted so it reloads
+the selected credentials. If any loaded turn is active (or cannot be verified
+safe), the switch is refused and `auth.json` is left unchanged.
+
 Force a named account from `auth-NAME.json`:
 
 ```bash
 codexpick --account NAME
 ```
 
-Log in a new subscription and save it as `auth-NAME.json`:
+Log in a new subscription, save it as `auth-NAME.json`, and make it active
+without launching a new Codex session:
 
 ```bash
 codexpick --login NAME --no-launch
+```
+
+Renew or add a saved login without making it the active account:
+
+```bash
+codexpick --login NAME --no-activate
 ```
