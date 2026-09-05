@@ -62,12 +62,10 @@ class ProbeResult:
             if reached:
                 return str(reached)
         snapshot = display_snapshot(self.rate_limits)
-        short_window = used_percent(snapshot.get("primary"))
-        if short_window is not None and short_window >= 100:
-            return "5h quota spent"
-        weekly = used_percent(snapshot.get("secondary"))
-        if weekly is not None and weekly >= 100:
-            return "weekly quota spent"
+        for label, window in named_windows(snapshot).items():
+            percent = used_percent(window)
+            if percent is not None and percent >= 100:
+                return f"{label} quota spent"
         if (
             self.account.get("requiresOpenaiAuth")
             and not self.account.get("account")
@@ -658,9 +656,39 @@ def display_snapshot(rate_limits: dict | None) -> dict:
     return all_snapshots[0]
 
 
+def named_windows(snapshot: dict) -> dict[str, dict]:
+    """Name quota windows by duration, never by their primary/secondary slot."""
+    windows = {}
+    for slot in ("primary", "secondary"):
+        window = snapshot.get(slot)
+        if not isinstance(window, dict):
+            continue
+        minutes = window.get("windowDurationMins")
+        if type(minutes) is not int or minutes <= 0:
+            label = f"{slot} (duration unknown)"
+        elif minutes == 10080:
+            label = "weekly"
+        elif minutes % 1440 == 0:
+            label = f"{minutes // 1440}d"
+        elif minutes % 60 == 0:
+            label = f"{minutes // 60}h"
+        else:
+            label = f"{minutes}m"
+        if label in windows:
+            label = f"{label} ({slot})"
+        windows[label] = window
+    return windows
+
+
 def print_table(results: list[ProbeResult], selected: ProbeResult | None) -> None:
+    labels = ["5h", "weekly"]
+    account_windows = [named_windows(display_snapshot(r.rate_limits)) for r in results]
+    for windows in account_windows:
+        for label in windows:
+            if label not in labels:
+                labels.append(label)
     rows = []
-    for result in results:
+    for result, windows in zip(results, account_windows):
         snap = display_snapshot(result.rate_limits)
         account = result.account.get("account") if result.account else None
         plan = snap.get("planType") or (account or {}).get("planType") or "-"
@@ -668,14 +696,13 @@ def print_table(results: list[ProbeResult], selected: ProbeResult | None) -> Non
             "*" if selected is result else " ",
             result.candidate.name,
             str(plan),
-            fmt_percent(snap.get("primary")),
-            fmt_percent(snap.get("secondary")),
-            fmt_reset(snap.get("primary")),
-            fmt_reset(snap.get("secondary")),
+            *(fmt_percent(windows.get(label)) for label in labels),
+            *(fmt_reset(windows.get(label)) for label in labels),
             display_result_status(result),
         ])
 
-    headers = ["", "account", "plan", "5h used", "weekly used", "5h reset", "weekly reset", "status"]
+    headers = ["", "account", "plan", *(f"{label} used" for label in labels),
+               *(f"{label} reset" for label in labels), "status"]
     widths = [max(len(str(row[i])) for row in [headers, *rows]) for i in range(len(headers))]
     print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
     print("  ".join("-" * widths[i] for i in range(len(headers))))
