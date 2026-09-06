@@ -68,6 +68,12 @@ Check accounts without changing the active auth file:
 codexpick --check-only
 ```
 
+Quota columns use each window's `windowDurationMins`, not its
+`primary`/`secondary` position. A weekly-only account therefore has `-` in the
+5h columns and its usage/reset in the weekly columns. `-` means the window was
+not reported; other durations (or windows with unknown duration) get separate
+columns.
+
 Switch to the first usable account and launch Codex:
 
 ```bash
