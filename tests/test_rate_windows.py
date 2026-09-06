@@ -89,7 +89,7 @@ class RateWindowTests(unittest.TestCase):
                         return response
 
                     output = io.StringIO()
-                    with mock.patch.object(sys, "argv", ["codexpick", "--home", directory, "--check-only"]), \
+                    with mock.patch.object(sys, "argv", ["codexpick", "--no-update-check", "--home", directory, "--check-only"]), \
                          mock.patch.object(cli, "probe_candidate", side_effect=probe), \
                          contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
                         self.assertEqual(cli.main(), 0)

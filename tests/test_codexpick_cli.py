@@ -174,6 +174,7 @@ class ExplicitSelectionTests(unittest.TestCase):
 
             argv = [
                 "codexpick",
+                "--no-update-check",
                 "--home",
                 str(codex_home),
                 "--account",

@@ -2,7 +2,9 @@
 import argparse
 import base64
 import hashlib
+import importlib.metadata
 import json
+import math
 import os
 import pty
 import re
@@ -12,7 +14,6 @@ import shlex
 import signal
 import shutil
 import socket
-import stat
 import struct
 import subprocess
 import sys
@@ -24,7 +25,8 @@ from pathlib import Path
 
 DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
 DEFAULT_CODEX_BIN = os.environ.get("CODEX_BIN")
-VERSION = "0.1.0"
+VERSION = "0.2.0"
+REPOSITORY = "https://github.com/franchesoni/codexpick.git"
 
 
 class ProbeError(Exception):
@@ -184,8 +186,12 @@ class RawWebSocket:
 
 def main() -> int:
     args = parse_args()
+    if not args.no_update_check:
+        check_for_update()
     codex_home = args.home.expanduser().resolve()
     auth_path = codex_home / "auth.json"
+    if args.delete:
+        return delete_account(codex_home, args.delete)
     codex_bin = resolve_codex_bin()
     if args.login:
         return login_subscription(args, codex_home, auth_path, codex_bin)
@@ -209,6 +215,11 @@ def main() -> int:
         print(f"Selected: {forced_candidate.name}")
         return activate_candidate(args, auth_path, codex_bin, forced_candidate)
 
+    print(
+        "Warning: probes may refresh saved login tokens. Concurrent Codex sessions "
+        "using the same login may need to sign in again. Avoid probing while they are running.",
+        file=sys.stderr, flush=True,
+    )
     results = []
     candidates_to_probe = [forced_candidate] if forced_candidate else candidates
     for candidate in candidates_to_probe:
@@ -221,22 +232,120 @@ def main() -> int:
     selected = (
         next((r for r in results if r.candidate == forced_candidate), None)
         if forced_candidate
-        else next((r for r in results if r.usable), None)
+        else select_best_account(results)
     )
     print_table(results, selected)
     print_reauth_hints(results)
 
     if not selected:
         print("No usable account found; auth.json was left unchanged.", file=sys.stderr)
+        if not args.check_only:
+            return offer_relogin(args, results, codex_home, auth_path, codex_bin)
         return 1
 
     print(f"Selected: {selected.candidate.name}")
+    if not forced_candidate:
+        print(f"Tightest quota window: {quota_score(selected)[0]:g}% remaining.")
     if forced_candidate and selected.blocked_reason:
         print(f"Forced selection despite status: {selected.blocked_reason}")
     if args.check_only:
         return 0
 
     return activate_candidate(args, auth_path, codex_bin, selected.candidate)
+
+
+def quota_score(result: ProbeResult) -> tuple[float, float]:
+    remaining = [100 - percent for window in named_windows(display_snapshot(result.rate_limits)).values()
+                 if (percent := used_percent(window)) is not None]
+    if not remaining:
+        return (-1, -1)
+    return (min(remaining), sum(remaining) / len(remaining))
+
+
+def select_best_account(results: list[ProbeResult]) -> ProbeResult | None:
+    # The tightest window is the first constraint. Unknown quota is not unlimited.
+    return max((r for r in results if r.usable and quota_score(r)[0] > 0),
+               key=quota_score, default=None)
+
+
+def needs_relogin(result: ProbeResult) -> bool:
+    return is_reauth_error(result.error) or result.blocked_reason == "authentication required"
+
+
+def offer_relogin(args, results, codex_home, auth_path, codex_bin) -> int:
+    expired = [r for r in results if needs_relogin(r) and not r.duplicate_of]
+    if not expired or not sys.stdin.isatty():
+        return 1
+    print("Saved accounts needing login:")
+    for index, result in enumerate(expired, 1):
+        print(f"  {index}. {result.candidate.name}")
+    try:
+        answer = input("Log in to one of these accounts? Enter a number or name (Enter to skip): ").strip()
+    except EOFError:
+        return 1
+    chosen = next((r for r in expired if r.candidate.name == answer), None)
+    if chosen is None and answer.isdigit() and 1 <= int(answer) <= len(expired):
+        chosen = expired[int(answer) - 1]
+    if chosen is None:
+        return 1
+    login_args = argparse.Namespace(**vars(args))
+    login_args.login = chosen.candidate.name
+    login_args.no_activate = True
+    status = login_subscription(login_args, codex_home, auth_path, codex_bin)
+    if status:
+        return status
+    refreshed = probe_candidate(chosen.candidate, codex_home, codex_bin, args.timeout)
+    if not select_best_account([refreshed]):
+        print(f"Login saved, but no usable quota confirmed: {display_result_status(refreshed)}", file=sys.stderr)
+        return 1
+    return activate_candidate(args, auth_path, codex_bin, chosen.candidate)
+
+
+def delete_account(codex_home: Path, name: str) -> int:
+    candidate = find_candidate(discover_candidates(codex_home), name)
+    if not candidate:
+        print(f"No saved account named {name!r}.", file=sys.stderr)
+        return 2
+    # Keep removal recoverable, and never log out or remove active auth.json.
+    trash = codex_home / ".codexpick-trash"
+    trash.mkdir(mode=0o700, exist_ok=True)
+    target = trash / f"{candidate.path.name}.{time.time_ns()}"
+    candidate.path.rename(target)
+    print(f"Removed saved account {name!r}. Active sessions and auth.json were left unchanged.")
+    print(f"Recoverable from {target}")
+    return 0
+
+
+def installed_revision() -> str | None:
+    source = Path(__file__).resolve().parent
+    if (source / ".git").exists():
+        result = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"],
+                                capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            return result.stdout.strip()
+    try:
+        metadata = importlib.metadata.distribution("codexpick").read_text("direct_url.json")
+        return json.loads(metadata or "{}").get("vcs_info", {}).get("commit_id")
+    except (importlib.metadata.PackageNotFoundError, ValueError):
+        return None
+
+
+def check_for_update() -> None:
+    try:
+        local = installed_revision()
+        if not local:
+            return
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        remote = subprocess.run(["git", "ls-remote", REPOSITORY, "HEAD"],
+                                capture_output=True, text=True, timeout=2, env=env)
+        if remote.returncode == 0 and remote.stdout.split():
+            revision = remote.stdout.split()[0]
+            if revision != local:
+                print(f"codexpick update available: remote {revision[:8]} (installed {local[:8]}). "
+                      "Run: pipx upgrade codexpick", file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass  # An offline update check must never block account selection.
 
 
 def activate_candidate(
@@ -269,18 +378,28 @@ def activate_candidate(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Pick the first auth-*.json account whose live Codex quota is not blocked."
+        description="Pick the saved Codex account with the most remaining quota."
     )
     parser.add_argument("--check-only", action="store_true", help="probe and report without changing auth.json")
     parser.add_argument("--no-launch", action="store_true", help="switch auth.json but do not launch Codex")
-    parser.add_argument("-a", "--account", help="switch to this auth-* account name regardless of quota status")
-    parser.add_argument("--login", metavar="NAME", help="run remote Codex login and save it as auth-NAME.json")
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument("-a", "--account", help="switch to this auth-* account name regardless of quota status")
+    action.add_argument("--login", metavar="NAME", help="run remote Codex login and save it as auth-NAME.json")
+    action.add_argument("--delete", metavar="NAME", help="remove one saved account (recoverable; leaves active auth alone)")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument("--no-update-check", action="store_true", help="skip the remote revision check")
     parser.add_argument("--no-activate", action="store_true", help="with --login, save the auth snapshot but leave auth.json unchanged")
     parser.add_argument("--cmd", default="codex", help="launcher command for normal mode, e.g. codex or codexaz")
     parser.add_argument("--home", type=Path, default=Path(os.environ.get("CODEXPICK_HOME", DEFAULT_CODEX_HOME)))
-    parser.add_argument("--timeout", type=float, default=20.0, help="seconds per account probe")
+    parser.add_argument("--timeout", type=float, default=10.0, help="seconds per account probe (default: 10)")
     parser.add_argument("codex_args", nargs=argparse.REMAINDER, help="arguments passed to the launcher")
     args = parser.parse_args()
+    if args.timeout <= 0 or not math.isfinite(args.timeout):
+        parser.error("--timeout must be a finite positive number")
+    if args.no_activate and not args.login:
+        parser.error("--no-activate requires --login")
+    if args.check_only and (args.login or args.delete):
+        parser.error("--check-only cannot be combined with --login or --delete")
     if args.codex_args and args.codex_args[0] == "--":
         args.codex_args = args.codex_args[1:]
     if args.check_only and args.no_launch:
@@ -308,7 +427,8 @@ def login_subscription(args: argparse.Namespace, codex_home: Path, auth_path: Pa
         print(f"Starting Codex remote login for {name!r}.")
         print("Follow the browser/device prompts. The existing auth.json will be left alone until login succeeds.")
         sys.stdout.flush()
-        completed = subprocess.run([str(codex_bin), "login", "--device-auth"], env=env)
+        completed = subprocess.run([str(codex_bin), "-c", 'cli_auth_credentials_store="file"',
+                                    "login", "--device-auth"], env=env)
         if completed.returncode != 0:
             print(f"Login failed with exit code {completed.returncode}; auth files were left unchanged.", file=sys.stderr)
             return completed.returncode
@@ -370,6 +490,7 @@ def backup_existing_auth(path: Path, replacement_path: Path) -> Path | None:
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup_path = path.with_name(f"{path.name}.bak-{stamp}")
     shutil.copy2(path, backup_path)
+    os.chmod(backup_path, 0o600)
     return backup_path
 
 
@@ -426,7 +547,7 @@ def probe_candidate(candidate: Candidate, codex_home: Path, codex_bin: Path, tim
 
 def mark_duplicate_accounts(results: list[ProbeResult]) -> None:
     seen: dict[str, str] = {}
-    for result in results:
+    for result in sorted(results, key=lambda r: (r.usable, quota_score(r)), reverse=True):
         account_key = read_account_key(result.candidate.path)
         if not account_key:
             continue
@@ -456,7 +577,8 @@ def probe_app_server(candidate: Candidate, codex_home: Path, codex_bin: Path, ti
         prepend_binary_dir(env, codex_bin)
 
         proc = subprocess.Popen(
-            [str(codex_bin), "app-server", "--listen", f"unix://{sock_path}"],
+            [str(codex_bin), "-c", 'cli_auth_credentials_store="file"',
+             "app-server", "--listen", f"unix://{sock_path}"],
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -472,19 +594,22 @@ def probe_app_server(candidate: Candidate, codex_home: Path, codex_bin: Path, ti
                     "capabilities": {"experimentalApi": True},
                 }, timeout)
                 ws.send_json({"method": "initialized"})
-                account = rpc(ws, 2, "account/read", {"refreshToken": True}, timeout)
+                account = rpc(ws, 2, "account/read", {"refreshToken": False}, timeout)
                 try:
                     rate_limits = rpc(ws, 3, "account/rateLimits/read", None, timeout)
                 except ProbeError as exc:
                     if not is_method_unavailable(exc):
                         raise
-                    rate_limits = fallback_status_probe(candidate, codex_home, codex_bin, timeout)
-                sync_refreshed_auth(tmp_home / "auth.json", candidate.path)
+                    rate_limits = fallback_status_probe(
+                        Candidate(candidate.name, tmp_home / "auth.json"), codex_home, codex_bin, timeout)
                 return account, rate_limits
             finally:
                 ws.close()
         finally:
             stop_process(proc)
+            # A failed quota request can still have rotated the refresh token.
+            # Persist it even on failure, before deleting the temporary home.
+            sync_refreshed_auth(tmp_home / "auth.json", candidate.path)
 
 
 def wait_for_socket(proc: subprocess.Popen, sock_path: Path, timeout: float) -> None:
@@ -538,7 +663,7 @@ def fallback_status_probe(candidate: Candidate, codex_home: Path, codex_bin: Pat
 
         master_fd, slave_fd = pty.openpty()
         proc = subprocess.Popen(
-            [str(codex_bin), "--no-alt-screen"],
+            [str(codex_bin), "-c", 'cli_auth_credentials_store="file"', "--no-alt-screen"],
             env=env,
             stdin=slave_fd,
             stdout=slave_fd,
@@ -575,6 +700,7 @@ def fallback_status_probe(candidate: Candidate, codex_home: Path, codex_bin: Pat
                 pass
             os.close(master_fd)
             stop_process(proc)
+            sync_refreshed_auth(tmp_home / "auth.json", candidate.path)
     raise ProbeError("rateLimits API unavailable; /status fallback did not produce a usable result")
 
 
@@ -711,7 +837,7 @@ def print_table(results: list[ProbeResult], selected: ProbeResult | None) -> Non
 
 
 def display_result_status(result: ProbeResult, max_length: int = 52) -> str:
-    reason = result.blocked_reason or "ok"
+    reason = result.blocked_reason or ("ok" if quota_score(result)[0] >= 0 else "quota unknown")
     if result.error and is_reauth_error(result.error):
         return "reauth required"
     if len(reason) <= max_length:
@@ -729,12 +855,19 @@ def is_reauth_error(error: str | None) -> bool:
         "authentication token has been invalidated",
         "could not parse your authentication token",
         "try signing in again",
+        "refresh_token_expired",
+        "refresh_token_reused",
+        "refresh_token_invalidated",
+        "token_expired",
+        "token has expired",
+        "401 unauthorized",
+        "authentication required",
     )
     return any(marker in lowered for marker in auth_markers)
 
 
 def print_reauth_hints(results: list[ProbeResult]) -> None:
-    affected = [result.candidate.name for result in results if is_reauth_error(result.error)]
+    affected = [result.candidate.name for result in results if needs_relogin(result)]
     if not affected:
         return
     print("\nRenew saved login(s) without changing the active Codex account:")
@@ -746,14 +879,15 @@ def fmt_percent(window) -> str:
     percent = used_percent(window)
     if percent is None:
         return "-"
-    return f"{percent}%"
+    return f"{percent:g}%"
 
 
-def used_percent(window) -> int | None:
+def used_percent(window) -> float | None:
     if not isinstance(window, dict) or window.get("usedPercent") is None:
         return None
     try:
-        return int(window["usedPercent"])
+        value = float(window["usedPercent"])
+        return value if math.isfinite(value) and value >= 0 else None
     except (TypeError, ValueError):
         return None
 
@@ -776,8 +910,7 @@ def switch_auth(auth_path: Path, selected_path: Path) -> bool:
             shutil.copyfileobj(src, fh)
             fh.flush()
             os.fsync(fh.fileno())
-        mode = stat.S_IMODE(selected_path.stat().st_mode)
-        os.chmod(tmp_path, mode)
+        os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, auth_path)
         dir_fd = os.open(auth_path.parent, os.O_DIRECTORY)
         try:
@@ -810,6 +943,7 @@ def activate_auth_snapshot(
         and daemon.account_email
         and selected_email
         and daemon.account_email.casefold() == selected_email.casefold()
+        and read_account_key(auth_path) == read_account_key(selected_path)
     )
     restart_required = bool(daemon and not daemon_matches)
 
@@ -823,6 +957,14 @@ def activate_auth_snapshot(
         raise ActivationError(
             f"the shared Codex app-server is using another account and has {detail}; "
             "auth.json was left unchanged. Finish those turns and run codexpick again"
+        )
+
+    if restart_required or not auth_path.exists() or sha256_file(auth_path) != sha256_file(selected_path):
+        print(
+            "Warning: switching shared auth.json can affect currently running Codex sessions; "
+            "they may need to reconnect or sign in again."
+            + (" The idle shared app-server will be restarted." if restart_required else ""),
+            file=sys.stderr, flush=True,
         )
 
     previous_path = None
@@ -1003,14 +1145,16 @@ def refresh_candidates_from_active_auth(auth_path: Path, candidates: list[Candid
     for candidate in candidates:
         if candidate.path == auth_path:
             continue
-        if read_account_key(candidate.path) == active_account_key:
+        if (read_account_key(candidate.path) == active_account_key
+                and auth_path.stat().st_mtime_ns > candidate.path.stat().st_mtime_ns):
             sync_refreshed_auth(auth_path, candidate.path)
 
 
 def sync_refreshed_auth(source_path: Path, target_path: Path) -> bool:
     if not source_path.exists() or not target_path.exists():
         return False
-    if read_account_key(source_path) != read_account_key(target_path):
+    source_key = read_account_key(source_path)
+    if not source_key or source_key != read_account_key(target_path):
         return False
     if sha256_file(source_path) == sha256_file(target_path):
         return False
