@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,58 @@ class RankingTests(unittest.TestCase):
 
 
 class FlowTests(unittest.TestCase):
+    def test_first_run_names_current_working_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = root / "auth.json"
+            active.write_text(json.dumps({"tokens": {"account_id": "current"}}))
+            args = argparse.Namespace()
+
+            with mock.patch("builtins.input", return_value="work account"), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                candidates, status = cli.onboard_first_account(
+                    args, root, active, Path("codex")
+                )
+
+            self.assertIsNone(status)
+            self.assertEqual([candidate.name for candidate in candidates], ["work-account"])
+            saved = root / "auth-work-account.json"
+            self.assertEqual(saved.read_bytes(), active.read_bytes())
+            self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+
+    def test_first_run_without_working_login_creates_named_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            active = root / "auth.json"
+            active.write_text(json.dumps({"tokens": {"account_id": "current"}}))
+            args = argparse.Namespace(login=None)
+
+            with mock.patch("builtins.input", side_effect=["", "new account"]), \
+                 mock.patch.object(cli, "login_subscription", return_value=0) as login, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                candidates, status = cli.onboard_first_account(
+                    args, root, active, Path("codex")
+                )
+
+            self.assertEqual(candidates, [])
+            self.assertEqual(status, 0)
+            self.assertEqual(login.call_args.args[0].login, "new-account")
+
+    def test_first_run_with_no_active_credentials_asks_only_for_new_login(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = argparse.Namespace(login=None)
+
+            with mock.patch("builtins.input", return_value="fresh") as prompt, \
+                 mock.patch.object(cli, "login_subscription", return_value=0), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                _, status = cli.onboard_first_account(
+                    args, root, root / "auth.json", Path("codex")
+                )
+
+            self.assertEqual(status, 0)
+            prompt.assert_called_once_with("Name a new login to create (Enter to cancel): ")
+
     def test_deletion_preserves_active_auth_and_other_accounts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -118,6 +171,23 @@ class UpdateTests(unittest.TestCase):
 
 
 class CredentialTests(unittest.TestCase):
+    def test_stale_daemon_socket_is_treated_as_stopped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            socket_path = root / "app-server-control" / "app-server-control.sock"
+            socket_path.parent.mkdir()
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.bind(str(socket_path))
+            stale.close()
+            failed = subprocess.CompletedProcess(
+                [], 1, "", "Connection refused (os error 111)"
+            )
+
+            with mock.patch.object(cli.subprocess, "run", return_value=failed):
+                self.assertIsNone(
+                    cli.inspect_managed_daemon(root, Path("codex"), 1)
+                )
+
     def test_older_active_copy_does_not_replace_newer_saved_tokens(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

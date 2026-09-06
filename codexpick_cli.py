@@ -198,8 +198,14 @@ def main() -> int:
 
     candidates = discover_candidates(codex_home)
     if not candidates:
-        print(f"No candidates found in {codex_home}/auth-*.json", file=sys.stderr)
-        return 2
+        if args.account or args.check_only or not sys.stdin.isatty():
+            print(f"No candidates found in {codex_home}/auth-*.json", file=sys.stderr)
+            return 2
+        candidates, status = onboard_first_account(
+            args, codex_home, auth_path, codex_bin
+        )
+        if status is not None:
+            return status
 
     forced_candidate = find_candidate(candidates, args.account) if args.account else None
     if args.account and not forced_candidate:
@@ -299,6 +305,43 @@ def offer_relogin(args, results, codex_home, auth_path, codex_bin) -> int:
         print(f"Login saved, but no usable quota confirmed: {display_result_status(refreshed)}", file=sys.stderr)
         return 1
     return activate_candidate(args, auth_path, codex_bin, chosen.candidate)
+
+
+def onboard_first_account(
+    args: argparse.Namespace,
+    codex_home: Path,
+    auth_path: Path,
+    codex_bin: Path,
+) -> tuple[list[Candidate], int | None]:
+    print(f"No saved logins found in {codex_home}.")
+    if read_account_id(auth_path):
+        try:
+            name = input(
+                "Name the current working login "
+                "(Enter if there is no working login): "
+            ).strip()
+        except EOFError:
+            return [], 2
+        if name:
+            name = normalize_auth_name(name)
+            target_path = codex_home / f"auth-{name}.json"
+            switch_auth(target_path, auth_path)
+            print(f"Saved the current login as {target_path.name}.")
+            return discover_candidates(codex_home), None
+
+    try:
+        name = input("Name a new login to create (Enter to cancel): ").strip()
+    except EOFError:
+        return [], 2
+    if not name:
+        print("No login created; auth.json was left unchanged.", file=sys.stderr)
+        return [], 2
+
+    login_args = argparse.Namespace(**vars(args))
+    login_args.login = normalize_auth_name(name)
+    return [], login_subscription(
+        login_args, codex_home, auth_path, codex_bin
+    )
 
 
 def delete_account(codex_home: Path, name: str) -> int:
@@ -1029,6 +1072,8 @@ def inspect_managed_daemon(
     fallback_socket = codex_home / "app-server-control" / "app-server-control.sock"
     if completed.returncode != 0:
         if fallback_socket.exists():
+            if not unix_socket_is_listening(fallback_socket):
+                return None
             detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else completed.returncode
             raise ActivationError(f"could not inspect the running Codex app-server: {detail}")
         # Older Codex installations do not have a managed daemon. In that
@@ -1088,6 +1133,22 @@ def inspect_managed_daemon(
         raise
     except Exception as exc:
         raise ActivationError(f"could not safely inspect loaded Codex turns: {compact_error(exc)}") from exc
+
+
+def unix_socket_is_listening(path: Path) -> bool:
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.2)
+    try:
+        probe.connect(str(path))
+        return True
+    except (ConnectionRefusedError, FileNotFoundError):
+        return False
+    except OSError:
+        # Permission errors and other unknown failures cannot prove the daemon
+        # is stopped, so keep the conservative refusal behavior.
+        return True
+    finally:
+        probe.close()
 
 
 def restart_managed_daemon(

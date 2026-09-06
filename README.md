@@ -56,6 +56,11 @@ You can also run the local wrapper directly:
 
 `codexpick` does not require a config file. Export environment variables only if you need custom paths.
 
+On the first interactive run, if no named snapshots exist, `codexpick` asks you
+to name the current working `auth.json`. If you have no working login, leave that
+prompt blank; it then asks for a name and starts a new device login. Check-only
+and noninteractive runs do not prompt.
+
 Variables:
 
 - `CODEXPICK_HOME`: directory containing `auth.json` and `auth-*.json`; defaults to `~/.codex`.
