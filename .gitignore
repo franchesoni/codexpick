@@ -1,5 +1,9 @@
 .env
 auth*.json
+.auth.*.json
+.codexpick/
+.codexpick-trash/
+.codexpick.lock
 *.bak-*
 *.log
 *.sqlite

@@ -79,6 +79,9 @@ class ActivationTests(unittest.TestCase):
             )
         )
         self.codex_bin = Path("codex")
+        self.daemon_command = mock.patch.object(codexpick_cli, "run_daemon_command")
+        self.daemon_command.start()
+        self.addCleanup(self.daemon_command.stop)
 
     @staticmethod
     def _jwt(claims):

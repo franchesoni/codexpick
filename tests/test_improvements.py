@@ -224,6 +224,7 @@ class CredentialTests(unittest.TestCase):
                 return mock.Mock()
 
             with mock.patch.object(cli.subprocess, "Popen", side_effect=start), \
+                 mock.patch.object(cli, "inspect_managed_daemon", return_value=None), \
                  mock.patch.object(cli, "wait_for_socket"), \
                  mock.patch.object(cli, "RawWebSocket"), \
                  mock.patch.object(cli, "rpc", side_effect=cli.ProbeError("quota unavailable")), \
@@ -231,7 +232,7 @@ class CredentialTests(unittest.TestCase):
                 probed = cli.probe_candidate(cli.Candidate("test", saved), root, Path("codex"), 1)
             self.assertEqual(probed.error, "quota unavailable")
             self.assertEqual(json.loads(saved.read_text())["tokens"]["refresh_token"], "new-fake")
-            self.assertEqual(active.read_text(), original)
+            self.assertEqual(active.read_bytes(), saved.read_bytes())
             self.assertIn('cli_auth_credentials_store="file"', command)
             self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
 
@@ -243,7 +244,7 @@ class CredentialTests(unittest.TestCase):
             selected.write_text("new")
             output = io.StringIO()
 
-            def switch(*args):
+            def switch(*args, **kwargs):
                 self.assertIn("Warning:", output.getvalue())
                 return True
 
