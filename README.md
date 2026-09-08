@@ -75,7 +75,7 @@ export CODEX_BIN=/path/to/codex
 
 ## Usage
 
-Check accounts without changing the active auth file:
+Check accounts without switching the active account:
 
 ```bash
 codexpick --check-only
@@ -100,12 +100,14 @@ codexpick --no-launch
 ```
 
 If a managed Codex app-server is running, `codexpick` checks its in-memory
-account before changing `auth.json`. An idle daemon is restarted so it reloads
-the selected credentials. If any loaded turn is active (or cannot be verified
-safe), the switch is refused and `auth.json` is left unchanged.
+account before changing `auth.json`. An idle daemon is stopped before replacement
+and restarted with the selected credentials, including a new login for the same
+account. If any loaded turn is active (or cannot be verified safe), the switch
+is refused. Quota checks may still refresh the current account's credentials.
 
 Before probing or switching, warnings explain possible effects on existing
-sessions. Probes and login use a temporary Codex home with file credential storage,
+sessions. Login uses a temporary Codex home; probes use the active home or a
+persistent home for an inactive login. New processes use file credential storage,
 so they do not write to the OS credential store. Probes avoid requesting a forced
 refresh, but Codex can still refresh tokens automatically. Refreshed credentials
 are saved even when quota lookup fails. Existing sessions sharing those tokens
@@ -135,10 +137,12 @@ Remove one saved account:
 codexpick --delete NAME
 ```
 
-This moves only `auth-NAME.json` to `.codexpick-trash` under the Codex home, prints
-its recovery path, and leaves active credentials and other accounts alone. It
-does not revoke credentials or sign out existing sessions. To restore it, move
-the printed file back to `auth-NAME.json`.
+This recovers any pending probe renewal, then moves `auth-NAME.json` to
+`.codexpick-trash` under the Codex home and prints its recovery path. Its private
+probe home, if present, is archived alongside it with a `.probe` suffix. Active
+credentials and other accounts are left alone. Recovery conflicts refuse
+deletion and preserve both logins. Deletion does not revoke credentials or sign
+out existing sessions. To restore it, move the printed file back to `auth-NAME.json`.
 
 Force a named account from `auth-NAME.json`:
 
@@ -157,4 +161,52 @@ Renew or add a saved login without making it the active account:
 
 ```bash
 codexpick --login NAME --no-activate
+```
+
+## Authentication lifecycle
+
+Quota checks allow Codex's normal token renewal; they do not force a refresh.
+For the active login, checks reuse the managed app-server when available, or
+run against the actual Codex home. A refresh therefore reaches `auth.json`
+directly. Saved snapshots of that session are updated without replacing a
+different login for the same account or restoring an older token generation.
+
+Inactive logins use a private, persistent `.codexpick/NAME/` directory inside
+the Codex home. Its `auth.json` preserves renewals even when the quota RPC or
+the `/status` fallback fails. A `source.sha256` checkpoint permits recovery on
+the next invocation and prevents overwriting a snapshot changed during the
+probe. Do not remove this directory while recovery is pending. A conflict is
+reported with its recovery path; an explicit `--login NAME --no-activate` saves
+a fresh login and backs up the interrupted probe before clearing its checkpoint.
+The `/status` fallback runs only after the preceding probe process has stopped;
+it is not started alongside an existing managed daemon with an unsupported API.
+
+`.codexpick.lock` serializes account operations within one Codex home. A second
+operation is refused while the first is running. Probe and login children keep
+the lock if their parent is killed; wait for or stop that process before retrying.
+The lock is released when launching an ordinary Codex session. It does not
+coordinate other programs or other machines: do not replace credentials manually
+during an operation, and finish unmanaged CLI sessions before changing accounts.
+
+Use an independent login for each account on each machine. Copying a refreshable
+session to several concurrently used machines is not made safe by a local lock.
+Existing revoked tokens cannot be repaired by this change. A newer saved profile
+can be selected explicitly; if its refresh is also rejected, obtain a fresh login.
+See [Codex authentication](https://learn.chatgpt.com/docs/auth) and the
+[credential persistence guidance](https://learn.chatgpt.com/docs/auth/ci-cd-auth).
+
+## Tests
+
+Run the regression suite without accounts or network access:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The optional integration tests run a real Codex executable with synthetic
+credentials, a temporary home, and OAuth/quota endpoints on loopback. They check
+renewal, quota failures, repeated checks, and switching between two accounts.
+
+```bash
+CODEXPICK_TEST_CODEX_BIN=/absolute/path/to/codex python -m unittest discover -s tests -v
 ```
